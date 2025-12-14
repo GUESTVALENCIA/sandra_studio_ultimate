@@ -1,0 +1,25 @@
+{
+  "servers": [
+    {
+      "id": "mcp-render",
+      "name": "MCP Render (Producción)",
+      "type": "http",
+      "url": "https://pwa-imbf.onrender.com",
+      "enabled": true
+    },
+    {
+      "id": "mcp-local",
+      "name": "MCP Local (Fallback)",
+      "type": "stdio",
+      "command": "node",
+      "args": ["C:\\Users\\clayt\\Desktop\\IA-SANDRA\\mcp-integrado\\build\\index.js"],
+      "enabled": true,
+      "note": "Solo se usa si MCP Render falla"
+    }
+  ],
+  "defaultServer": "mcp-render",
+  "executionMode": "direct",
+  "identityLock": true,
+  "allowedResponses": ["✅", "❌", "Hola.", "Soy Sandra."]
+}
+

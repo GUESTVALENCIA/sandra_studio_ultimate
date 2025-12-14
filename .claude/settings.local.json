@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(wmic:*)",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:\\Sandra-IA-8.0-Pro\\sandra_studio_ultimate\\MIC_REPAIR_DIAGNOSTIC.ps1\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File:*)",
+      "Bash(cat:*)",
+      "Bash(git checkout:*)"
+    ]
+  }
+}
