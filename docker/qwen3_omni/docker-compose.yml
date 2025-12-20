@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  qwen3-omni:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qwen3-omni-enterprise
+    ports:
+      - "8000:8000"  # API REST
+      - "8001:8001"  # WebSocket streaming
+      - "7860:7860"  # Interfaz web (opcional)
+    volumes:
+      - ./models:/models:rw  # Directorio de modelos
+      - ./data:/app/data:rw  # Datos de entrenamiento
+      - ./logs:/app/logs:rw  # Logs
+      - ./config:/app/config:rw  # Configuración
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_HOME=/usr/local/cuda
+      - MODEL_PATH=/models/qwen3-omni-30b-a3b-instruct
+      - MAX_SEQ_LEN=128000
+      - BATCH_SIZE=1
+      - NUM_GPUS=1
+      - USE_CUDA_GRAPH=true
+      - ENABLE_STREAMING=true
+      - STREAMING_LATENCY=100
+      - ENABLE_MULTIMODAL=true
+      - ENABLE_SPEECH=true
+      - SPEECH_SAMPLE_RATE=24000
+      - SPEECH_BIT_DEPTH=16
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  sandra-qwen3-bridge:
+    build:
+      context: ../../
+      dockerfile: docker/sandra_bridge/Dockerfile
+    container_name: sandra-qwen3-bridge
+    ports:
+      - "4777:4777"  # Puerto de Sandra
+    depends_on:
+      - qwen3-omni
+    environment:
+      - QWEN3_OMNI_HOST=qwen3-omni
+      - QWEN3_OMNI_PORT=8000
+      - ENABLE_VOICE_STREAMING=true
+      - STREAMING_LATENCY=150
+      - ENABLE_MULTIMODAL_STREAMING=true
+      - MULTIMODAL_LATENCY=200
+    restart: unless-stopped
+    networks:
+      - sandra_network
+
+networks:
+  sandra_network:
+    driver: bridge
+
+volumes:
+  qwen3_models:
+    driver: local
+  sandra_data:
+    driver: local

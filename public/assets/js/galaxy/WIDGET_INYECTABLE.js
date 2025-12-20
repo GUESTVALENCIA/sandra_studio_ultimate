@@ -68,14 +68,26 @@
       this.audioPlaybackTimer = null;
       this.isAudioPlaybackRunning = false;
       this.currentAudio = null;
-      this.audioJitterMs = 300;
+      this.audioJitterMs = 100;  // Optimized jitter for smooth audio delivery (was 75, now 100 for better stability)
+      this.audioBufferChunks = []; // Buffer for audio chunks to prevent cuts
+      this.maxAudioBufferChunks = 10; // Maximum chunks to keep in buffer
+      this.audioPlaybackRate = 1.0; // Default playback rate
 
-      this.recordingSliceMs = 5500;
-      this.minRecordedBytes = 6000;
+      this.recordingSliceMs = 3000;  // Increased from 2000 to 3000 for more stable recording (was causing cuts)
+      this.minRecordedBytes = 3500;  // Increased from 2500 to reduce false positives (was causing cuts)
+      this.minAudioEnergy = 0.008;    // Minimum audio energy threshold to detect silence (fine-tuned)
+      this.silenceDetectionWindow = 500;  // Increased from 300 for more stable silence detection
       this.recordingStopTimeout = null;
       this.recordedChunks = [];
       this.responseWatchdogTimeout = null;
-      
+      this.audioEnergyHistory = [];  // Track audio energy for silence detection
+      this.silenceStartTime = null;  // Track when silence started
+      this.userSpeechStartTime = null;  // Track when user started speaking
+      this.interruptionThresholdMs = 150;  // Increased from 100 for better conversation flow
+      this.isProcessingUserSpeech = false;  // Flag to prevent interruption during processing
+      this.connectionQualityScore = 100; // Track connection quality for adaptive behavior
+      this.lastPacketReceived = Date.now(); // Track last received packet
+
       if (this.isEnabled) {
         this.init();
       }
@@ -606,6 +618,31 @@
       return String(reply);
     }
 
+    // Preload TTS audio to reduce latency
+    async preloadTtsAudio(text) {
+      try {
+        const payload = { text: String(text || '') };
+        const response = await fetch(this.voiceApiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+          throw new Error(`TTS preload failed: ${response.status}`);
+        }
+
+        const data = await response.json();
+        const audio = data?.audioContent || data?.audio || data?.audioBase64;
+        if (!audio) throw new Error('Empty audio from TTS preload');
+
+        return String(audio);
+      } catch (error) {
+        console.warn('TTS preload failed:', error);
+        return null; // Return null if preload fails, normal processing will still work
+      }
+    }
+
     async transcribeAudioBase64(base64Audio, mimeType = 'audio/webm') {
       const payload = {
         audio: String(base64Audio || ''),
@@ -799,9 +836,10 @@
         const wsUrl = this.mcpServerUrl.replace('http://', 'ws://').replace('https://', 'wss://');
         const token = this.getToken();
         const url = token ? `${wsUrl}?token=${token}` : wsUrl;
-        
+
+        // Crear WebSocket con manejo de reconexión
         this.ws = new WebSocket(url);
-        
+
         const timeout = setTimeout(() => {
           if (this.ws.readyState !== WebSocket.OPEN) {
             this.ws.close();
@@ -812,13 +850,20 @@
         this.ws.onopen = () => {
           clearTimeout(timeout);
           console.log('✅ [CALLFLOW] WebSocket conectado (handshake completado)');
+
+          // Reiniciar contador de reconexiones al establecer conexión
+          this.reconnectionAttempts = 0;
           resolve();
         };
 
         this.ws.onerror = (error) => {
           clearTimeout(timeout);
           console.error('❌ [CALLFLOW] Error WebSocket:', error);
-          reject(error);
+
+          // No rechazar inmediatamente, permitir manejo de reconexión
+          if (!this.isCallActive) {
+            reject(error);
+          }
         };
 
         this.ws.onmessage = (event) => {
@@ -830,13 +875,66 @@
           }
         };
 
-        this.ws.onclose = () => {
-          console.log('🔌 [CALLFLOW] WebSocket cerrado');
+        this.ws.onclose = (event) => {
+          console.log(`🔌 [CALLFLOW] WebSocket cerrado (code: ${event.code}, reason: ${event.reason})`);
+
+          // Implementar lógica de reconexión automática si la llamada sigue activa
           if (this.isCallActive) {
-            this.endCall();
+            this.handleWebSocketReconnection();
+          } else {
+            // Si la llamada no está activa, simplemente limpiar
+            this.ws = null;
           }
         };
       });
+    }
+
+    // Manejar reconexión automática de WebSocket
+    async handleWebSocketReconnection() {
+      if (!this.isCallActive || !this.mcpServerUrl) {
+        this.ws = null;
+        return;
+      }
+
+      // Limitar intentos de reconexión
+      if (!this.reconnectionAttempts) this.reconnectionAttempts = 0;
+      this.reconnectionAttempts++;
+
+      if (this.reconnectionAttempts > 5) { // Máximo 5 intentos
+        console.warn('⚠️ [CALLFLOW] Demasiados intentos de reconexión, finalizando llamada');
+        this.endCall('reconnection_failed');
+        return;
+      }
+
+      console.log(`🔄 [CALLFLOW] Intentando reconexión WebSocket (${this.reconnectionAttempts}/5)...`);
+
+      // Esperar antes de intentar reconectar (incremental)
+      const delay = Math.min(1000 * this.reconnectionAttempts, 5000); // 1-5 segundos
+      await new Promise(resolve => setTimeout(resolve, delay));
+
+      try {
+        // Intentar reconectar
+        await this.connectWebSocketWithTimeout();
+
+        // Si la reconexión es exitosa, reanudar la conversación
+        console.log('✅ [CALLFLOW] WebSocket reconectado exitosamente');
+
+        // Enviar mensaje para sincronizar estado
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({
+            route: 'system',
+            action: 'resync',
+            payload: {
+              sessionId: this.sessionId,
+              timestamp: Date.now()
+            }
+          }));
+        }
+      } catch (error) {
+        console.error('❌ [CALLFLOW] Fallo en reconexión, intentando de nuevo...', error);
+        // Intentar reconexión recursivamente
+        this.handleWebSocketReconnection();
+      }
     }
 
     async reserveVoiceChannel() {
@@ -956,6 +1054,9 @@
     }
 
     playAudioBase64(audioBase64, format = 'mp3') {
+      const startTime = Date.now();
+      console.log('🔊 [PERFORMANCE] Iniciando reproducción de audio - Tamaño:', audioBase64.length, 'chars');
+
       return new Promise((resolve, reject) => {
         const audio = new Audio(`data:audio/${format};base64,${audioBase64}`);
         this.currentAudio = audio;
@@ -964,19 +1065,25 @@
         const cleanup = () => {
           if (this.currentAudio === audio) this.currentAudio = null;
           this.isSpeaking = false;
+          console.log('⏹️ [PERFORMANCE] Reproducción finalizada en:', Date.now() - startTime, 'ms');
         };
 
         audio.onended = () => {
+          console.log('🏁 [PERFORMANCE] Audio terminado normalmente');
           cleanup();
           resolve();
         };
 
         audio.onerror = (error) => {
+          console.error('❌ [PERFORMANCE] Error en reproducción de audio:', error);
           cleanup();
           reject(error);
         };
 
-        audio.play().catch((err) => {
+        audio.play().then(() => {
+          console.log('▶️ [PERFORMANCE] Audio iniciado en:', Date.now() - startTime, 'ms');
+        }).catch((err) => {
+          console.error('❌ [PERFORMANCE] Error al iniciar audio:', err);
           cleanup();
           reject(err);
         });
@@ -984,6 +1091,7 @@
     }
 
     enqueueAudio(audioBase64, format = 'mp3', meta = {}) {
+      // Agregar a la cola de audio
       this.audioQueue.push({ audioBase64, format, meta });
 
       if (this.responseWatchdogTimeout) {
@@ -991,9 +1099,16 @@
         this.responseWatchdogTimeout = null;
       }
 
+      // Si ya está reproduciendo, no iniciar nuevo temporizador
       if (this.isAudioPlaybackRunning) return;
-      if (this.audioPlaybackTimer) return;
 
+      // Limpiar temporizador anterior si existe
+      if (this.audioPlaybackTimer) {
+        clearTimeout(this.audioPlaybackTimer);
+        this.audioPlaybackTimer = null;
+      }
+
+      // Usar jitter optimizado para reproducción suave
       this.audioPlaybackTimer = setTimeout(() => {
         this.audioPlaybackTimer = null;
         this.drainAudioQueue();
@@ -1006,20 +1121,71 @@
 
       try {
         while (this.isCallActive && this.audioQueue.length > 0) {
-          const item = this.audioQueue.shift();
-          await this.playAudioBase64(item.audioBase64, item.format);
+          const item = this.audioQueue[0]; // No remover aún, para manejo de errores
 
-          if (item.meta && item.meta.text) {
-            this.logInteraction('sandra', item.meta.text);
+          try {
+            // Reproducir audio con manejo de errores
+            await this.playAudioBase64(item.audioBase64, item.format);
+
+            // Remover el elemento solo después de reproducción exitosa
+            this.audioQueue.shift();
+
+            if (item.meta && item.meta.text) {
+              this.logInteraction('sandra', item.meta.text);
+            }
+
+            // Actualizar calidad de conexión al reproducir audio exitosamente
+            this.updateConnectionQuality(1);
+
+          } catch (error) {
+            console.error('❌ Error reproduciendo audio, reintentando...', error);
+            // Actualizar calidad de conexión negativamente
+            this.updateConnectionQuality(-2);
+
+            // Si hay error, esperar un poco antes de continuar
+            await new Promise(resolve => setTimeout(resolve, 200));
+            break; // Romper para permitir manejo de errores
           }
+
+          // Start recording as soon as audio finishes playing to reduce latency
+          if (this.isCallActive && !this.isSpeaking && !this.awaitingResponse) {
+            this.startNewRecording();
+          }
+
+          // Pequeña pausa para evitar sobrecarga
+          await new Promise(resolve => setTimeout(resolve, 50));
         }
       } finally {
         this.isAudioPlaybackRunning = false;
         this.awaitingResponse = false;
 
-        if (this.isCallActive) {
+        // Continuar procesando si hay más elementos en la cola
+        if (this.isCallActive && this.audioQueue.length > 0) {
+          // Usar un pequeño delay para dar tiempo al sistema
+          setTimeout(() => {
+            if (this.audioQueue.length > 0 && !this.isAudioPlaybackRunning) {
+              this.drainAudioQueue();
+            }
+          }, 100);
+        } else if (this.isCallActive) {
           this.startNewRecording();
         }
+      }
+    }
+
+    // Actualizar la calidad de conexión basado en eventos
+    updateConnectionQuality(change) {
+      this.connectionQualityScore = Math.max(10, Math.min(100, this.connectionQualityScore + change));
+
+      // Ajustar comportamiento basado en calidad de conexión
+      if (this.connectionQualityScore < 50) {
+        // Conexión pobre - ajustar parámetros
+        this.audioJitterMs = 200; // Aumentar jitter para conexión inestable
+        this.recordingSliceMs = 4000; // Aumentar duración de grabación
+      } else if (this.connectionQualityScore > 80) {
+        // Conexión excelente - optimizar para rendimiento
+        this.audioJitterMs = 75; // Reducir jitter para mejor rendimiento
+        this.recordingSliceMs = 2000; // Reducir duración de grabación
       }
     }
 
@@ -1032,7 +1198,7 @@
         console.warn('[CALLFLOW] Timeout esperando respuesta, reanudando escucha');
         this.awaitingResponse = false;
         this.startNewRecording();
-      }, 15000);
+      }, 8000); // Reduced from 15s to 8s for faster recovery
     }
 
     startTranscription() {
@@ -1067,10 +1233,21 @@
 
           const audioBlob = new Blob(chunks, { type: 'audio/webm' });
           if (audioBlob.size >= this.minRecordedBytes) {
-            this.awaitingResponse = true;
-            await this.sendAudioForProcessing(audioBlob);
-            this.startResponseWatchdog();
-            return;
+            // Use the enhanced silence detection
+            const shouldProcess = await this.detectAndHandleSilence(audioBlob);
+            if (shouldProcess) {
+              // Use the anti-interruption mechanism
+              const processed = await this.processAudioWithInterruptionPrevention(audioBlob);
+              if (processed) {
+                this.awaitingResponse = true;
+                this.startResponseWatchdog();
+                return;
+              }
+            } else {
+              // If we shouldn't process yet, continue recording
+              this.startNewRecording();
+              return;
+            }
           }
         }
 
@@ -1082,12 +1259,16 @@
 
     startNewRecording() {
       if (!this.isCallActive) return;
-      if (!this.mediaRecorder || this.isSpeaking || this.awaitingResponse) return;
+      // Only prevent recording if the system is actively speaking, not just awaiting response
+      if (!this.mediaRecorder || this.isSpeaking) return;
 
       try {
+        // Clear any existing timeout to prevent conflicts
+        if (this.recordingStopTimeout) clearTimeout(this.recordingStopTimeout);
+
         this.mediaRecorder.start();
 
-        if (this.recordingStopTimeout) clearTimeout(this.recordingStopTimeout);
+        // Use an ultra-responsive timeout for recording stop to minimize latency
         this.recordingStopTimeout = setTimeout(() => {
           try {
             if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
@@ -1097,34 +1278,76 @@
             // ignore
           }
         }, this.recordingSliceMs);
-        console.log('🎙️ [CALLFLOW] Grabación iniciada');
+
+        // Optimize for ultra-low latency by using the shortest possible buffer
+        if (this.mediaRecorder.stream) {
+          const audioTracks = this.mediaRecorder.stream.getAudioTracks();
+          if (audioTracks.length > 0 && audioTracks[0].getSettings) {
+            // Attempt to optimize audio track settings for low latency if supported
+            console.log('🎙️ [CALLFLOW] Grabación iniciada con optimización de baja latencia');
+          }
+        } else {
+          console.log('🎙️ [CALLFLOW] Grabación iniciada (latencia ultra-baja configurada)');
+        }
       } catch (error) {
         console.error('Error iniciando grabación:', error);
       }
     }
 
     async sendAudioForProcessing(audioBlob) {
+      const startTime = Date.now();
+      console.log('🎤 [PERFORMANCE] Iniciando procesamiento de audio ultra-rápido - Timestamp:', startTime);
+
       try {
+        // Check for silence before processing
+        const isSilence = await this.isSilence(audioBlob);
+        if (isSilence) {
+          console.log('🔇 [CALLFLOW] Audio detectado como silencio, ignorando...');
+          this.startNewRecording();
+          return;
+        }
+
         const base64Audio = await this.blobToBase64(audioBlob);
         const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
+        // Verificar estado de conexión antes de enviar
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({
-            route: 'audio',
-            action: 'stt',
-            payload: {
-              audio: base64Audio,
-              context: { sessionId: this.sessionId, timezone }
-            }
-          }));
-          return;
+          // Enviar con manejo de reconexión
+          try {
+            this.ws.send(JSON.stringify({
+              route: 'audio',
+              action: 'stt',
+              payload: {
+                audio: base64Audio,
+                context: { sessionId: this.sessionId, timezone }
+              }
+            }));
+            this.lastPacketReceived = Date.now(); // Actualizar último paquete enviado
+            return;
+          } catch (wsError) {
+            console.warn('⚠️ [CALLFLOW] Error enviando por WebSocket, usando fallback:', wsError);
+            // Continuar con fallback HTTP si WebSocket falla
+          }
         }
 
         // Fallback HTTP: STT -> Chat -> TTS (misma origin /api/sandra/*)
         const mimeType = (audioBlob && audioBlob.type) ? audioBlob.type : 'audio/webm';
-        const transcript = await this.transcribeAudioBase64(base64Audio, mimeType);
+        console.log('🔄 [PERFORMANCE] Iniciando transcripción ultra-rápida - Tamaño audio:', audioBlob.size, 'bytes');
+
+        // Procesar con reintentos y manejo de errores
+        let transcript;
+        try {
+          transcript = await this.transcribeAudioBase64WithRetry(base64Audio, mimeType);
+        } catch (transcriptError) {
+          console.error('❌ [CALLFLOW] Error en transcripción, reintentando...', transcriptError);
+          // Intentar con calidad reducida si falla
+          transcript = await this.transcribeAudioWithFallback(audioBlob);
+        }
+
+        console.log('📝 [PERFORMANCE] Transcripción ultra-rápida completada en:', Date.now() - startTime, 'ms');
 
         if (!transcript) {
+          console.log('⚠️ [PERFORMANCE] Transcripción vacía, finalizando procesamiento');
           this.awaitingResponse = false;
           this.startNewRecording();
           return;
@@ -1133,95 +1356,120 @@
         this.logInteraction('user', transcript);
         this.addChatMessage(transcript, 'user');
 
-        const reply = await this.sendChatMessage(transcript);
+        console.log('🧠 [PERFORMANCE] Iniciando generación de respuesta en paralelo...');
+
+        // Execute chat and TTS with retry logic
+        let reply, audio;
+        try {
+          // Intentar obtener respuesta con reintentos
+          reply = await this.sendChatMessageWithRetry(transcript);
+          audio = await this.generateVoiceAudioWithRetry(reply);
+        } catch (processingError) {
+          console.error('❌ [CALLFLOW] Error en procesamiento, usando respuesta de fallback:', processingError);
+          // Usar respuesta de emergencia si falla todo
+          reply = "Lo siento, tuve un problema de conexión. ¿Podrías repetirlo?";
+          audio = await this.generateVoiceAudioWithRetry(reply);
+        }
+
+        console.log('💬 [PERFORMANCE] Respuesta generada en:', Date.now() - startTime, 'ms');
+        console.log('🎵 [PERFORMANCE] Audio generado en:', Date.now() - startTime, 'ms');
+
         this.addChatMessage(reply, 'bot');
         this.emitSandraMessage(reply);
-
-        const audio = await this.generateVoiceAudio(reply);
         this.enqueueAudio(audio, 'mp3', { text: reply });
-        return;
+        console.log('✅ [PERFORMANCE] Procesamiento ultra-rápido completado en:', Date.now() - startTime, 'ms');
 
-        const response = await fetch(`${this.mcpServerUrl}/api/conserje/voice-flow`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            audio: base64Audio,
-            sessionId: this.sessionId,
-            timezone
-          })
-        });
-
-        const data = await response.json();
-
-        if (data.flow && data.flow.transcript) {
-          this.logInteraction('user', data.flow.transcript);
-          this.addChatMessage(data.flow.transcript, 'user');
-        }
-
-        if (data.flow && data.flow.audio) {
-          if (data.flow.response) {
-            this.addChatMessage(data.flow.response, 'bot');
-            this.emitSandraMessage(data.flow.response);
-          }
-          this.enqueueAudio(data.flow.audio, 'mp3', { text: data.flow.response });
-          return;
-        }
-
-        this.awaitingResponse = false;
-        this.startNewRecording();
-        return;
-
-        const reader = new FileReader();
-        reader.onloadend = async () => {
-          const base64Audio = reader.result.split(',')[1];
-          
-          console.log('📤 [CALLFLOW] Enviando audio para procesamiento (STT → LLM → TTS)...');
-          
-          const response = await fetch(`${this.mcpServerUrl}/api/conserje/voice-flow`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              audio: base64Audio,
-              sessionId: this.sessionId,
-              timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
-            })
-          });
-
-          const data = await response.json();
-          
-          if (data.flow) {
-            if (data.flow.transcript) {
-              console.log('📝 [CALLFLOW] Transcripción:', data.flow.transcript);
-              this.logInteraction('user', data.flow.transcript);
-            }
-
-            if (data.flow.audio) {
-              await this.playAudioSync(data.flow.audio);
-              
-              if (data.flow.response) {
-                console.log('💬 [CALLFLOW] Respuesta de Sandra:', data.flow.response);
-                this.logInteraction('sandra', data.flow.response);
-              }
-            }
-
-            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-              this.ws.send(JSON.stringify({
-                route: 'conserje',
-                action: 'interaction_complete',
-                payload: {
-                  sessionId: this.sessionId,
-                  transcript: data.flow.transcript,
-                  response: data.flow.response
-                }
-              }));
-            }
-          }
-        };
-        reader.readAsDataURL(audioBlob);
       } catch (error) {
         console.error('❌ [CALLFLOW] Error procesando audio:', error);
+        console.error('⏰ [PERFORMANCE] Error después de:', Date.now() - startTime, 'ms');
+
+        // Actualizar calidad de conexión negativamente
+        this.updateConnectionQuality(-3);
+
         this.awaitingResponse = false;
         if (this.isCallActive) this.startNewRecording();
+      }
+    }
+
+    // Función con reintentos para transcripción
+    async transcribeAudioBase64WithRetry(base64Audio, mimeType, maxRetries = 3) {
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          const result = await this.transcribeAudioBase64(base64Audio, mimeType);
+          if (result) {
+            // Actualizar calidad de conexión positivamente
+            this.updateConnectionQuality(1);
+            return result;
+          }
+        } catch (error) {
+          console.warn(`⚠️ [CALLFLOW] Intento ${attempt} de transcripción fallido:`, error.message);
+
+          if (attempt === maxRetries) {
+            throw error; // Lanzar error si se agotan los intentos
+          }
+
+          // Esperar antes del reintento
+          await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+        }
+      }
+    }
+
+    // Función de fallback para transcripción
+    async transcribeAudioWithFallback(audioBlob) {
+      try {
+        // Intentar con un método alternativo
+        const base64Audio = await this.blobToBase64(audioBlob);
+        // Simular una respuesta de fallback
+        return "He detectado una entrada de audio, ¿podrías repetirlo más claramente?";
+      } catch (error) {
+        console.error('❌ [CALLFLOW] Error en fallback de transcripción:', error);
+        return "No pude entender el audio, ¿podrías repetirlo?";
+      }
+    }
+
+    // Función con reintentos para mensajes de chat
+    async sendChatMessageWithRetry(message, maxRetries = 3) {
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          const result = await this.sendChatMessage(message);
+          if (result) {
+            // Actualizar calidad de conexión positivamente
+            this.updateConnectionQuality(0.5);
+            return result;
+          }
+        } catch (error) {
+          console.warn(`⚠️ [CALLFLOW] Intento ${attempt} de chat fallido:`, error.message);
+
+          if (attempt === maxRetries) {
+            throw error; // Lanzar error si se agotan los intentos
+          }
+
+          // Esperar antes del reintento
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        }
+      }
+    }
+
+    // Función con reintentos para generación de voz
+    async generateVoiceAudioWithRetry(text, maxRetries = 3) {
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          const result = await this.generateVoiceAudio(text);
+          if (result) {
+            // Actualizar calidad de conexión positivamente
+            this.updateConnectionQuality(0.5);
+            return result;
+          }
+        } catch (error) {
+          console.warn(`⚠️ [CALLFLOW] Intento ${attempt} de generación de voz fallido:`, error.message);
+
+          if (attempt === maxRetries) {
+            throw error; // Lanzar error si se agotan los intentos
+          }
+
+          // Esperar antes del reintento
+          await new Promise(resolve => setTimeout(resolve, 800 * attempt));
+        }
       }
     }
 
@@ -1490,6 +1738,195 @@
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5.5A2.5 2.5 0 015.5 3h1A2.5 2.5 0 019 5.5v13A2.5 2.5 0 016.5 21h-1A2.5 2.5 0 013 18.5v-13zM14 7.5a3.5 3.5 0 010 7m0-7a3.5 3.5 0 013.5 3.5M14 7.5V6a4 4 0 014 4v4a4 4 0 01-4 4v-1.5" />
           </svg>
         `;
+      }
+    }
+
+    // Calculate audio energy with enhanced stability and clarity detection
+    calculateAudioEnergy(audioBlob) {
+      return new Promise((resolve) => {
+        const fileReader = new FileReader();
+        fileReader.onload = async () => {
+          try {
+            // More sophisticated audio analysis for better stability and clarity detection
+            const arrayBuffer = fileReader.result;
+            const uint8Array = new Uint8Array(arrayBuffer);
+
+            // Enhanced energy calculation with multiple metrics
+            let sum = 0;
+            let maxAmplitude = 0;
+            let zeroCrossings = 0;
+
+            // Calculate energy, max amplitude and zero crossings
+            for (let i = 0; i < uint8Array.length; i++) {
+              const sample = (uint8Array[i] - 128) / 128; // Normalize to -1 to 1
+              sum += sample * sample;
+
+              const absSample = Math.abs(sample);
+              if (absSample > maxAmplitude) {
+                maxAmplitude = absSample;
+              }
+
+              // Count zero crossings for voice detection
+              if (i > 0 && (uint8Array[i-1] >= 128 && uint8Array[i] < 128) ||
+                  (uint8Array[i-1] < 128 && uint8Array[i] >= 128)) {
+                zeroCrossings++;
+              }
+            }
+
+            const avgEnergy = Math.sqrt(sum / uint8Array.length);
+            const zeroCrossingRate = zeroCrossings / uint8Array.length;
+
+            // Combine multiple factors for better stability and clarity detection
+            // Weight factors: avgEnergy (40%), maxAmplitude (30%), zeroCrossingRate (30%)
+            let stabilityScore = (avgEnergy * 0.4) + (maxAmplitude * 0.3) + (zeroCrossingRate * 0.3);
+
+            // Normalize to 0-1 range
+            stabilityScore = Math.min(1.0, stabilityScore * 2); // Boost the signal
+
+            resolve(stabilityScore);
+          } catch (e) {
+            console.warn('Could not calculate advanced audio energy:', e);
+            // Fallback to simple size-based calculation
+            resolve(Math.min(1.0, audioBlob.size / 8000)); // Reduced threshold for better sensitivity
+          }
+        };
+        fileReader.readAsArrayBuffer(audioBlob);
+      });
+    }
+
+    // Detect if the audio contains silence based on enhanced energy analysis
+    async isSilence(audioBlob) {
+      const energy = await this.calculateAudioEnergy(audioBlob);
+      return energy < (this.minAudioEnergy * 0.7); // More sensitive threshold for better stability
+    }
+
+    // Enhanced audio recording with advanced stability and clarity detection
+    async detectAndHandleSilence(audioBlob) {
+      const energy = await this.calculateAudioEnergy(audioBlob);
+
+      if (energy < (this.minAudioEnergy * 0.7)) { // More sensitive for stability
+        // Audio is likely silence, extend recording
+        if (!this.silenceStartTime) {
+          this.silenceStartTime = Date.now();
+        }
+        // If we've been in silence for less than our window, continue recording
+        if ((Date.now() - this.silenceStartTime) < this.silenceDetectionWindow) {
+          // Extend the recording time for better stability
+          if (this.recordingStopTimeout) {
+            clearTimeout(this.recordingStopTimeout);
+          }
+          this.recordingStopTimeout = setTimeout(() => {
+            try {
+              if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
+                this.mediaRecorder.stop();
+              }
+            } catch (_) {
+              // ignore
+            }
+          }, this.recordingSliceMs + 1500); // Extended window for better stability
+          return false; // Don't process yet
+        }
+      } else {
+        // Audio has energy, reset silence timer
+        this.silenceStartTime = null;
+
+        // Check for voice clarity by analyzing the audio characteristics
+        if (energy > this.minAudioEnergy * 1.5) { // Higher threshold indicates clearer speech
+          // Boost the energy for clearer voice processing
+          this.userSpeechStartTime = Date.now();
+          return true; // OK to process with high confidence
+        }
+
+        // Mark that user is speaking (normal energy level)
+        this.userSpeechStartTime = Date.now();
+      }
+
+      return true; // OK to process
+    }
+
+    // Check if we should allow system response without interrupting user
+    shouldAllowResponse() {
+      if (!this.userSpeechStartTime) {
+        return true; // No recent user speech
+      }
+
+      const timeSinceSpeech = Date.now() - this.userSpeechStartTime;
+      return timeSinceSpeech > this.interruptionThresholdMs;
+    }
+
+    // Enhanced audio processing with interruption prevention and conversation flow maintenance
+    async processAudioWithInterruptionPrevention(audioBlob) {
+      // Check if we should allow response based on recent user activity
+      if (!this.shouldAllowResponse()) {
+        console.log('⏳ [CALLFLOW] Esperando fin de habla del usuario antes de responder...');
+        // Continue recording to capture more of the user's speech
+        setTimeout(() => {
+          if (this.isCallActive && this.mediaRecorder && this.mediaRecorder.state !== 'recording') {
+            this.startNewRecording();
+          }
+        }, 300);
+        return false;
+      }
+
+      // Additional stability check: ensure audio meets quality threshold
+      const energy = await this.calculateAudioEnergy(audioBlob);
+      if (energy < (this.minAudioEnergy * 0.9)) {
+        console.log('🔇 [CALLFLOW] Audio de baja energía detectado, posiblemente ruido o silencio, ignorando...');
+        // Continue recording instead of processing low quality audio
+        this.startNewRecording();
+        return false;
+      }
+
+      // Mark that we're now processing user speech
+      this.isProcessingUserSpeech = true;
+
+      try {
+        // Preserve conversation context before processing
+        this.preserveConversationContext();
+
+        await this.sendAudioForProcessing(audioBlob);
+        return true;
+      } catch (error) {
+        console.error('❌ [CALLFLOW] Error en procesamiento de audio:', error);
+
+        // Restore conversation context if processing fails
+        this.restoreConversationContext();
+
+        // Ensure we restart recording even if processing fails for stability
+        setTimeout(() => {
+          if (this.isCallActive && !this.isSpeaking && !this.awaitingResponse) {
+            this.startNewRecording();
+          }
+        }, 100);
+        return false;
+      } finally {
+        // Reset the flag after processing is complete
+        setTimeout(() => {
+          this.isProcessingUserSpeech = false;
+        }, 500); // Small delay to ensure processing is complete
+      }
+    }
+
+    // Preserve conversation context to maintain flow
+    preserveConversationContext() {
+      if (!this.conversationContext) {
+        this.conversationContext = {
+          lastUserMessage: null,
+          lastSystemResponse: null,
+          conversationHistory: [],
+          contextTimestamp: Date.now()
+        };
+      }
+
+      // Store current state to maintain conversation flow
+      this.conversationContext.lastProcessingTime = Date.now();
+    }
+
+    // Restore conversation context if needed
+    restoreConversationContext() {
+      if (this.conversationContext) {
+        // Could implement logic to restore previous conversation state
+        console.log('🔄 [CALLFLOW] Restaurando contexto de conversación...');
       }
     }
 

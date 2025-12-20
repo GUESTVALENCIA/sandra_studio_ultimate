@@ -1319,38 +1319,62 @@
         }, 2000);
       });
 
-      // AI Search Handler - connects with Sandra
+      // AI Search Handler - connects with real Qwen Pure API
       async function handleAISearch(destination, guests, nights) {
         // Show loading state
-        setSubtitles('Procesando tu búsqueda...');
+        setSubtitles('Sandra IA está procesando tu solicitud...');
+        
+        const mcpUrl = 'https://pwa-imbf.onrender.com'; // Servidor Qwen Pure Real
+        
+        try {
+          const userPrompt = `Soy un cliente buscando alojamiento.
+Destino: ${destination || 'Valencia'}
+Huéspedes: ${guests}
+Noches: ${nights}
 
-        // Simulate Sandra processing
-        // In production, this will connect to actual Sandra API
-        const searchQuery = {
-          destination: destination || 'Valencia',
-          guests: parseInt(guests),
-          nights: parseInt(nights)
-        };
+Por favor invéntate 3 opciones de alojamiento atractivas basadas en estos datos y recomiéndame la mejor.
+Responde de forma breve y persuasiva como una experta en turismo.`;
 
-        // Simulate Sandra response
-        setTimeout(() => {
-          setSubtitles(`Perfecto, encontré alojamientos para ${guests} personas por ${nights} noche${nights > 1 ? 's' : ''} en ${destination || 'Valencia'}. Te muestro las opciones...`);
+          console.log('📡 Conectando a Qwen Pure:', `${mcpUrl}/api/qwen/chat`);
 
-          // Navigate to accommodations page after Sandra confirms
-          setTimeout(() => {
-            location.hash = 'alojamientos';
-            navigate();
+          const response = await fetch(`${mcpUrl}/api/qwen/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              message: userPrompt,
+              model: 'qwen-main', // Usar el modelo principal
+              enableMCP: true
+            })
+          });
+
+          if (!response.ok) throw new Error(`Error API: ${response.status}`);
+          
+          const data = await response.json();
+          console.log('✅ Respuesta Qwen:', data);
+
+          if (data.reply) {
+            // Mostrar respuesta real de Qwen
+            setSubtitles(data.reply);
             
-            // Filter accommodations if destination is specified
-            if (destination) {
-              filterAccommodationsByDestination(destination);
-            }
-
+            // Navegar a alojamientos
             setTimeout(() => {
-              setSubtitles('Aquí tienes los alojamientos disponibles. ¿Cuál te interesa?');
-            }, 1000);
+              location.hash = 'alojamientos';
+              navigate();
+              
+              if (destination) {
+                filterAccommodationsByDestination(destination);
+              }
+            }, 4000); // Dar tiempo a leer la respuesta
+          }
+
+        } catch (error) {
+          console.error('❌ Error Qwen:', error);
+          setSubtitles('Lo siento, tuve un problema de conexión. Pero aquí tienes nuestros alojamientos disponibles.');
+          setTimeout(() => {
+             location.hash = 'alojamientos';
+             navigate();
           }, 2000);
-        }, 1500);
+        }
       }
 
       // Function to navigate to specific accommodation when Sandra says so
