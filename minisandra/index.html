@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Minisandra Kids</title>
+    <!-- Font Awesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+    <!-- Google Gemini SDK (Import map for module) -->
+    <script type="importmap">
+      {
+        "imports": {
+          "@google/generative-ai": "https://esm.run/@google/generative-ai"
+        }
+      }
+    </script>
+</head>
+<body>
+
+    <!-- Voice Interaction Overlay -->
+    <div id="voice-visualizer">
+        <div class="sandrita-face">🤖</div>
+        <div class="status-text" id="status-text">Escuchando...</div>
+        <button onclick="stopInteraction()" style="margin-top: 30px; padding: 10px 20px; border-radius: 20px; border: none; background: #ff4444; color: white; font-weight: bold; cursor: pointer;">Cancelar</button>
+    </div>
+
+    <div class="app-container">
+        <!-- Sidebar -->
+        <div class="sidebar glass">
+            <div class="logo-area">
+                <span class="logo-icon">🌈</span>
+                <span class="neon-text">Minisandra Kids</span>
+            </div>
+
+            <div class="sidebar-title">✨ Mis Tesoros ✨</div>
+
+            <button class="sidebar-btn" onclick="triggerPreset('unicorn')">
+                <span>🦄</span> Unicornio Volador
+            </button>
+            <button class="sidebar-btn" onclick="triggerPreset('candy')">
+                <span>🏰</span> Castillo de Chuches
+            </button>
+            <button class="sidebar-btn" onclick="triggerPreset('mermaid')">
+                <span>🧜‍♀️</span> Sirena en la Playa
+            </button>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- Avatar -->
+            <div class="avatar-container floating">
+                <img src="https://i.pravatar.cc/300?img=5" alt="Sandra" class="avatar-img" id="user-avatar">
+            </div>
+
+            <!-- Center Buttons -->
+            <div class="center-buttons">
+                <div class="big-btn" onclick="handleAction('video')">
+                    <i class="fa-solid fa-video" style="color: #6a5acd;"></i>
+                    <span class="big-btn-label">Crear Video</span>
+                </div>
+                <div class="big-btn" onclick="handleAction('imagine')">
+                    <i class="fa-solid fa-wand-magic-sparkles" style="color: #ffd700;"></i>
+                    <span class="big-btn-label">Imaginar</span>
+                </div>
+                <div class="big-btn" onclick="handleAction('nano')">
+                    <span class="icon">🍌</span>
+                    <span class="big-btn-label">Hablar Nano</span>
+                </div>
+            </div>
+
+            <!-- Bottom Dock -->
+            <div class="dock">
+                <button class="dock-btn youtube" onclick="openYouTube()">
+                    <i class="fa-brands fa-youtube"></i>
+                    <span class="dock-label">YouTube</span>
+                </button>
+                <button class="dock-btn camera" onclick="openCamera()">
+                    <i class="fa-solid fa-camera"></i>
+                    <span class="dock-label">Cámara</span>
+                </button>
+                <button class="dock-btn micro" onclick="startOneShotVoice()">
+                    <i class="fa-solid fa-microphone"></i>
+                    <span class="dock-label">Micro</span>
+                </button>
+                <button class="dock-btn call" onclick="startCallLoop()">
+                    <i class="fa-solid fa-phone"></i>
+                    <span class="dock-label">Llamar</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>
